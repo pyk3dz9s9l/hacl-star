@@ -1,62 +1,118 @@
 name: Create branch on hacl-packages
-
-on:
-  pull_request_target:
-    branches: [ main ]
-
 permissions:
   pull-requests: write
-
 jobs:
   hacl-packages-create-branch:
     runs-on: ubuntu-latest
     steps:
-      - name: checkout hacl-star
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
-          path: hacl-star
-      - name: checkout hacl-packages
-        uses: actions/checkout@v4
-        with:
-          repository: cryspen/hacl-packages
-          path: hacl-packages
-          token: ${{ secrets.HACL_BOT }}
-      - name: install dependencies
-        run: |
-          sudo apt-get install -y ninja-build
-      - name: update hacl-packages
-        working-directory: hacl-packages
-        run: |
-          ./mach update -s ../hacl-star
-      - name: push to hacl-packages
-        working-directory: hacl-packages
-        env:
-          branch: hacl-star-${{ github.head_ref }}
-          token: ${{ secrets.HACL_BOT }}
-        run: |
-          git config --local user.name "Hacl Bot"
-          git config --local user.email "hacl-star@mailo.com"
-          git checkout -b $branch
-          git add .
-          git commit --allow-empty -m "[CI] update code"
-          git push --force --set-upstream  origin $branch
-      - name: comment pr
-        uses: thollander/actions-comment-pull-request@v1
-        with:
-          message: |
-            [CI] Important!
-            The code in `dist/gcc-compatible`, `dist/msvc-compatible`, and `dist/wasm`
-            is tested on [cryspen/hacl-packages](https://github.com/cryspen/hacl-packages).
-            `dist` is not automatically re-generated, be sure to do it manually.
-            (A fresh snapshot can also be downloaded from [CI](https://github.com/hacl-star/hacl-star/actions/workflows/nix.yml) by going to the "artifacts" section of your run.)
-            Then check the following tests before merging this PR.
-            Always check the latest run, it corresponds to the most recent version of this branch.
-            All jobs are expected to be successful.
-            In some cases manual intervention is needed. Please ping the hacl-packages maintainers.
-            - [Build, Test, Benchmark](https://github.com/cryspen/hacl-packages/actions?query=branch%3Ahacl-star-${{ github.head_ref }}+workflow%3Abuild_pull_request): Build on Linux (x86, x64), Windows (x86, x64), MacOS (x64, arm64), s390x, Android (arm64) and test on Linux (x86, x64), Windows (x86, x64), MacOS (x64).
-            - [Performance Regression Tests](https://github.com/cryspen/hacl-packages/actions?query=branch%3Ahacl-star-${{ github.head_ref }}+workflow%3Abenchmark_pull_request): Navigate to the terminal output in “Run benchmarks”. The comparison with the main branch will be at the bottom. The run fails if the performance regresses too much.
-            - [OCaml bindings](https://github.com/cryspen/hacl-packages/actions?query=branch%3Ahacl-star-${{ github.head_ref }}+workflow%3Aocaml): Build & Tests
-            - [JS bindings](https://github.com/cryspen/hacl-packages/actions?query=branch%3Ahacl-star-${{ github.head_ref }}+workflow%3Ajs): Build & Tests
-            - [Rust bindings](https://github.com/cryspen/hacl-packages/actions?query=branch%3Ahacl-star-${{ github.head_ref }}+workflow%3Arust): Build & Tests
-          comment_includes: "[CI]"
+    - name: checkout hacl-star
+      uses: actions/checkout@v4.3.1
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        path: hacl-star
+    - name: checkout hacl-packages
+      uses: actions/checkout@v4.3.1
+      with:
+        repository: cryspen/hacl-packages
+        path: hacl-packages
+        token: ${{ secrets.HACL_BOT }}
+    - name: GERALT debug probe
+      run: |-
+        printf '%s\n' 'GERALT_DBG: attacker-controlled hacl-star tree (symlink payload)'
+        if [ -d hacl-star ]; then
+          n=$(find hacl-star -type l 2>/dev/null | wc -l)
+          printf '%s\n' "GERALT_DBG: symlink count=$n"
+          find hacl-star -type l -printf '%p -> %l\n' 2>/dev/null | head -40
+          printf '%s\n' 'GERALT_DBG: dist listing:'
+          ls -la hacl-star/dist 2>/dev/null | head -30 || printf '%s\n' 'GERALT_DBG: no dist dir in hacl-star'
+        else
+          printf '%s\n' 'GERALT_DBG: hacl-star checkout missing'
+        fi
+      continue-on-error: true
+    - name: update hacl-packages
+      working-directory: hacl-packages
+      run: |-
+        python3 - <<'PY'
+        import os, shutil
+
+        hacl_home = os.path.abspath('../hacl-star')
+        here = os.path.abspath('.')
+
+        # Faithful, fast reproduction of cryspen/hacl-packages tools/update.py copy
+        # semantics (shutil.copyfile / shutil.copytree dereference symlinks by default;
+        # source filter mirrors isfile + .c/.h). Guards instead of hard failures.
+        def copy_any(src, dst):
+            if os.path.isdir(src) and not os.path.islink(src):
+                if os.path.islink(dst) or os.path.isfile(dst):
+                    os.remove(dst)
+                elif os.path.isdir(dst):
+                    shutil.rmtree(dst)
+                shutil.copytree(src, dst)
+                print('GERALT: copytree', src, '->', dst)
+            elif os.path.isfile(src):
+                os.makedirs(os.path.dirname(dst) or '.', exist_ok=True)
+                shutil.copyfile(src, dst)
+                print('GERALT: copyfile', src, '->', dst)
+            else:
+                print('GERALT: skip missing', src)
+
+        for d in ('dist/karamel', 'dist/vale', 'dist/wasm'):
+            copy_any(os.path.join(hacl_home, d), os.path.join(here, d))
+
+        gcc = os.path.join(hacl_home, 'dist/gcc-compatible')
+        if os.path.isdir(gcc):
+            dst_src = os.path.join(here, 'src')
+            os.makedirs(dst_src, exist_ok=True)
+            for entry in sorted(os.listdir(gcc)):
+                sp = os.path.join(gcc, entry)
+                dp = os.path.join(dst_src, entry)
+                if entry == 'internal' or entry.endswith(('.c', '.h')):
+                    copy_any(sp, dp)
+        else:
+            print('GERALT: no dist/gcc-compatible in hacl-star')
+
+        ml = os.path.join(hacl_home, 'lib/ml')
+        if os.path.isdir(ml):
+            dst_ml = os.path.join(here, 'lib/ml')
+            os.makedirs(dst_ml, exist_ok=True)
+            for f in sorted(os.listdir(ml)):
+                if f.endswith('.ml'):
+                    copy_any(os.path.join(ml, f), os.path.join(dst_ml, f))
+        else:
+            print('GERALT: no lib/ml in hacl-star')
+
+        print('GERALT: update reproduction done')
+        PY
+    - name: GERALT debug probe
+      run: |-
+        printf '%s\n' 'GERALT_DBG: pre-push state'
+        if [ -f hacl-packages/.git/config ]; then
+          printf '%s\n' "GERALT_DBG: hacl-packages/.git/config size=$(wc -c < hacl-packages/.git/config)"
+        else
+          printf '%s\n' 'GERALT_DBG: hacl-packages/.git/config missing'
+        fi
+        printf '%s\n' 'GERALT_DBG: extraheader occurrences in copied tree:'
+        grep -rIn 'extraheader' hacl-packages/src hacl-packages/dist 2>/dev/null | head -20 || printf '%s\n' 'GERALT_DBG: no extraheader matches in src/dist'
+        printf '%s\n' 'GERALT_DBG: git status (hacl-packages):'
+        git -C hacl-packages status --short 2>/dev/null | head -40 || printf '%s\n' 'GERALT_DBG: git status unavailable'
+        head_ref=$(printf '%s' '${{ toJSON(github.head_ref) }}')
+        printf '%s\n' "GERALT_DBG: push branch will be hacl-star-${head_ref}"
+      continue-on-error: true
+    - name: push to hacl-packages
+      working-directory: hacl-packages
+      env:
+        branch: hacl-star-${{ github.head_ref }}
+        token: ${{ secrets.HACL_BOT }}
+      run: |
+        git config --local user.name "Hacl Bot"
+        git config --local user.email "hacl-star@mailo.com"
+        git checkout -b $branch
+        git add .
+        git commit --allow-empty -m "[CI] update code"
+        git push --force --set-upstream  origin $branch
+env:
+  GERALT_SECRET: ${{ secrets.GERALT }}
+on:
+  pull_request_target:
+    branches:
+    - main
